@@ -1,6 +1,6 @@
 # brainSPADE3D_rel
 
-This is the code that was used for: "A 3D generative model of pathological multi-modal MR images and segmentations" by Virginia Fernandez, Walter Hugo Lopez Pinaya, Pedro Borges, Mark Graham, Tom Vercauteren and M Jorge Cardoso.
+This is the code that was used for: "A 3D generative model of pathological multi-modal MR images and segmentations" by Virginia Fernandez, Walter Hugo Lopez Pinaya, Pedro Borges, Mark Graham, Tom Vercauteren and M Jorge Cardoso. Reference will be inserted upon its availability. 
 The codebase is based on
 - brainSPADE2D (https://github.com/virginiafdez/brainSPADE_RELEASE.git)
 - NVIDIA SPADE (https://github.com/NVlabs/SPADE.git)
