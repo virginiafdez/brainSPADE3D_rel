@@ -1,0 +1,42 @@
+general:
+  labels:
+    0: 'background'
+    1: 'csf'
+    2: 'gm'
+    3: 'wm'
+    4: 'dgm'
+    5: 'brainstem'
+    6: 'wmh'
+    7: 'tumour'
+    8: 'edema'
+    9: 'gdtumour'
+label_generator:
+  cond_map:
+    0: 'wmh'
+    1: 'tumour'
+    2: 'edema'
+    3: 'gdtumour'
+  vae_uri: ''
+  ldm_uri: ""
+  wanted_cond: ['wmh', 'tumour', 'edema', 'gdtumour']
+  save_to: ""
+  cond_boundaries:
+    'wmh': [0.0097, 0.0923]
+    'tumour': [0.0224, 0.1833]
+    'edema': [0.1408, 0.3595]
+    'gdtumour': [0.0712, 0.4280]
+  image_shape: []
+  n_labels: 200
+  formats: ['.nii.gz']
+  scheduler_type: 'pndm'
+  kwargs_scheduler: ""
+  scale_factor: 1.0 # Make sure that it's the one used for the training!
+image_generator:
+    save_to: ""
+    data_dict: ""
+    style_dict:  ""
+    sequences: ['T1', 'FLAIR', 'T2']
+    checkpoints_path: ""
+    formats: ['.nii.gz']
+    append_ims: ""
+    n_passes: 3

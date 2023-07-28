@@ -1,0 +1,38 @@
+stage1:
+  spatial_dims: 3
+  base_lr: 0.000002
+  disc_lr: 0.0001
+  w_perceptual: 10
+  w_adversarial: 0.1
+  w_kl: 0.000000001
+  w_noiserob: 0.5
+  adv_down_threshold: 0.65
+  adv_up_threshold: 0.78
+  resolution: [160,176,112]
+  params:
+    hparams:
+      spatial_dims: 3
+      latent_channels: 8
+      in_channels: 10
+      out_channels: 10
+      num_channels: [32, 64, 128, 256]
+      num_res_blocks: [2, 2, 2,2]
+      norm_num_groups: 16
+      attention_levels: [False, False, False, False]
+discriminator:
+  params:
+    num_channels: 16
+    spatial_dims: 3
+    num_layers_d: 3
+    in_channels: 10
+    out_channels: 10
+    kernel_size: 4
+    activation: "LEAKYRELU"
+    norm: "BATCH"
+    bias: False
+    padding: 1
+perceptual_loss:
+  params:
+    spatial_dims: 3
+    network_type: "medicalnet_"
+    is_fake_3d: False

@@ -1,0 +1,32 @@
+ldm:
+  base_lr: 0.0002
+  end_lr: 0.000005
+  warmup_lr: 0.000001
+  epochs_warmup: 5
+  epochs_shift: 15
+  type_lr: "exponential"
+  resolution: [128,96,128]
+  params:
+    buffer_interval: 50
+    loss_type: "l2"
+    scale_factor: 0.5
+    ddpm:
+      num_train_timesteps: 1000
+      beta_schedule: "scaled_linear"
+      beta_start: 0.0015
+      beta_end: 0.0195
+      prediction_type: "epsilon"
+    unet_config:
+      params:
+        spatial_dims: 3
+        with_conditioning: True
+        in_channels: 8
+        out_channels: 8
+        attention_levels:  [False, False, True, True] #[False, True, True] #
+        num_res_blocks: 2
+        num_channels:  [64,128,256,512] #[16, 32, 64]
+        num_head_channels: [64,128,256,512] #[16, 32, 64]
+        resblock_updown: True
+        transformer_num_layers: 1
+        cross_attention_dim: 4
+        norm_num_groups: 16
