@@ -86,4 +86,3 @@ class ConvEncoder(BaseNetwork):
             p_z = HypersphericalUniform(self.opt.z_dim, -1, device=q_z.device)
             z = q_z.rsample()
             return z, q_z, p_z
-

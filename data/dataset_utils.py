@@ -94,8 +94,8 @@ def findSimilarName(original, directory, slice_index=-1, extension='.png', retur
 def create_datatext_source_image_gen(in_dirs, out_file, add_dataset = False, new_source = None,
                                      trvate = False, perc_val = 0.05, perc_test = 0.1,
                                      overwrite = False, additional_keywords = [],
-                                     slice_index = None
-                                     ):
+                                     slice_index = None,
+                                     filters=None):
     '''
 
     :param in_dirs: list of dictionaries, containing keywords representing the type of file embedded in the
@@ -112,6 +112,8 @@ def create_datatext_source_image_gen(in_dirs, out_file, add_dataset = False, new
     filenames in the different directories, pass it a list of string. For more information, see function findSimilarName.
     :param slice_index: If these aren't whole volumes, but slices, slice index is the index of the filename split
     by "_" where the slice number is (i.e. : File_something_something_[slice_no].png > slice_index = -1).
+    :param filters: if not None, it needs to be a dictionary with key train and test-val, pointing to a txt with
+    list of volumes to take into account for both splits. ignored if trvate is false
     :return:
     '''
 
@@ -172,14 +174,33 @@ def create_datatext_source_image_gen(in_dirs, out_file, add_dataset = False, new
     np.random.shuffle(rows)
 
     if trvate:
-        rows = [[row_names] + rows[:int(len(rows)*perc_val)],
-                [row_names] + rows[int(len(rows)*perc_val): (int(len(rows)*perc_val)+int(len(rows)*perc_test))],
-                [row_names] + rows[(int(len(rows)*perc_val)+int(len(rows)*perc_test)):]]
+        if filters is None:
+            rows = [[row_names] + rows[:int(len(rows)*perc_val)],
+                    [row_names] + rows[int(len(rows)*perc_val): (int(len(rows)*perc_val)+int(len(rows)*perc_test))],
+                    [row_names] + rows[(int(len(rows)*perc_val)+int(len(rows)*perc_test)):]]
+        else:
+            with open(filters['train'], 'r') as f:
+                labels_train = f.readlines()
+                f.close()
+            labels_train = [l.strip("\n") for l in labels_train]
+            with open(filters['test_val'], 'r') as f:
+                labels_val_test = f.readlines()
+                f.close()
+            labels_val_test = [l.strip("\n") for l in labels_val_test]
+            rows_train = [row for row in rows if row[0].split("/")[-1] in labels_train]
+            rows_val_test = [row for row in rows if row[0].split("/")[-1] in labels_val_test]
+            perc_val_new = perc_val / (perc_test + perc_val)
+            rows_val = rows_val_test[:int(len(rows_val_test)*perc_val_new)]
+            rows_test = rows_val_test[int(len(rows_val_test)*perc_val_new):]
+            rows = [[row_names] + rows_val,
+                    [row_names] + rows_test,
+                    [row_names] + rows_train]
+
         file_names = [out_file.replace(".tsv", "_%s.tsv" %i) for i in ['validation', 'test', 'train']]
         for find, f in enumerate(file_names):
+            if os.path.isfile(file_names[find]) and overwrite:
+                os.remove(file_names[find])
             for row in rows[find]:
-                if os.path.isfile(file_names[find]) and overwrite:
-                    os.remove(file_names[find])
                 with open(file_names[find], 'at') as f:
                     tsv_writer = csv.writer(f, delimiter='\t')
                     tsv_writer.writerow(row)
@@ -194,16 +215,22 @@ def create_datatext_source_image_gen(in_dirs, out_file, add_dataset = False, new
                 tsv_writer.writerow(row)
                 f.close()
 
-def filterTSV(in_dirs:list, keywords:list, in_column:str):
+def filterTSV(in_dirs:list, keywords:list, in_column:str, not_clause:bool=False):
 
     for file in in_dirs:
         df = pd.read_csv(file, sep="\t")
-        df_col = df[in_column]
-        matches = df.loc[df[in_column].apply(lambda x: any(k for k in keywords if k in x))]
-        matches.to_csv(file.replace(".tsv", "_%s_in_%s.tsv" %("-".join(keywords),
-                                                             in_column)),
-                       sep = "\t")
-
+        if not_clause:
+            matches = df.loc[df[in_column].apply(lambda x: any(k for k in keywords if k not in x))]
+            matches.to_csv(file.replace(".tsv", "_%s_notin_%s.tsv" % ("-".join(keywords),
+                                                                   in_column)),
+                           sep="\t",
+                           index=False)
+        else:
+            matches = df.loc[df[in_column].apply(lambda x: any(k for k in keywords if k in x))]
+            matches.to_csv(file.replace(".tsv", "_%s_in_%s.tsv" % ("-".join(keywords),
+                                                                   in_column)),
+                           sep="\t",
+                           index=False)
 
 def getExtension(file_path):
     if ".nii.gz" in file_path:
@@ -230,7 +257,9 @@ def create_datatext_source_label_gen(in_dirs: Union[list, str],
                                      lesion_dim: int = -1,
                                      perc_val: float = 0.05,
                                      perc_test: float = 0.1,
-                                     overwrite: bool =False):
+                                     overwrite: bool =False,
+                                     lesion_pixels: dict = None,
+                                     lesion_maxes: dict = None):
     '''
     Create TSVs to train label generator.
     :param in_dirs: list containing the paths with the labels or string leading to TSV file. MUST have a 'label'
@@ -248,8 +277,63 @@ def create_datatext_source_label_gen(in_dirs: Union[list, str],
     :param perc_val: percentage devoted to validation if trvate is on.
     :param perc_test: percentage devoted to test in trvate is on
     :param overwrite: if the out file(s) exists, delete and overwrite.
+    :param lesion_pixels: for recursive calls, dictionary of dictionaries containing the number of pixels for
+    each lesion label
+    :param lesion_maxes: for recursive calls, dictionary  containing the minimum and maximum
+    number of pixels across the data for each lesions
     :return:
     '''
+
+
+    # Lesion dimensions
+    couldnt_read = []
+    if len(lesions) > 0 and (lesion_pixels is None and lesion_maxes is None):
+        lesion_pixels = {}
+        lesion_maxes = {}
+        all_labels = []
+        if trvate and "*" in in_dirs:
+            for sub_file_ in ['train', 'validation', 'test']:
+                sub_file = in_dirs.replace("*", "_%s" %sub_file_)
+                with open(sub_file, 'r') as f:
+                    df = pd.read_csv(sub_file, sep="\t")
+                    for index, row in df.iterrows():
+                        all_labels.append(row['label'])
+                    f.close()
+        else:
+            with open(in_dirs, 'r') as f:
+                df = pd.read_csv(in_dirs, sep="\t")
+                for index, row in df.iterrows():
+                    all_labels.append(row['label'])
+            f.close()
+
+        for l in lesions:
+            lesion_maxes[l] = [1000000, 0]
+        for label in tqdm(all_labels):
+            lesion_pixels[label] = {}
+            try:
+                if ".npz" in label:
+                    label_array = np.load(label)['label']
+                elif ".nii.gz" in label:
+                    label_array = np.asarray(nib.load(label).dataobj)
+                elif ".npy" in label:
+                    label_array = np.load(label)
+                else:
+                    ValueError("Unsupported format: .%s" % label.split(".")[-1])
+            except FileNotFoundError:
+                couldnt_read.append(label)
+                print("Not found: %s" %label)
+                continue
+            for lesion in lesions:
+                if lesion_dim == -1:
+                    lesion_array = label_array[..., LESION_CHANNELS[lesion]]
+                else:
+                    lesion_array = label_array[LESION_CHANNELS[lesion], ...]
+                positives = (lesion_array > 0.5).sum()
+                lesion_pixels[label][lesion] = positives
+                if positives > lesion_maxes[lesion][-1]:
+                    lesion_maxes[lesion][-1] = positives
+                if positives < lesion_maxes[lesion][0]:
+                    lesion_maxes[lesion][0] = positives
 
     if lesion_dim not in [-1, 0,]:
         ValueError("Unsupported slicing for lesion dimensions different from -1 or 0. If you have used"
@@ -266,7 +350,8 @@ def create_datatext_source_label_gen(in_dirs: Union[list, str],
                 create_datatext_source_label_gen(in_dirs_sf, out_file=out_file.replace(".tsv", "_%s.tsv" %sub_file),
                                                  report_folder=report_folder, new_source=new_source, trvate=False,
                                                  shuffle=shuffle, lesions = lesions, lesion_dim = lesion_dim,
-                                                 overwrite=overwrite)
+                                                 overwrite=overwrite, lesion_pixels = lesion_pixels,
+                                                 lesion_maxes = lesion_maxes)
             return
         else:
             with open(in_dirs, 'r') as f:
@@ -304,7 +389,9 @@ def create_datatext_source_label_gen(in_dirs: Union[list, str],
     progress_bar.set_description("Reading labels and checking lesions")
     for _, label in progress_bar:
         # If we want to replace absolute paths with relatives we use new source ({abs_path_chunk : rel_path})
-
+        if len(lesion_pixels[label])==0:
+            print("We do not add label %s because it doesn't exist or could not be found." %label)
+            continue
         if new_source is not None:
             dir_label = "/".join(label.split("/")[:-1])
             label_root = label.split("/")[-1]
@@ -315,40 +402,43 @@ def create_datatext_source_label_gen(in_dirs: Union[list, str],
             row = [label]
 
         # Now we check for lesions
-        if len(lesions) > 0: # If we are using conditioning, otherwise we dont care.
-            if ".npz" in label:
-                label_array = np.load(label)['label']
-            elif ".nii.gz" in label:
-                label_array = np.asarray(nib.load(label).dataobj)
-            elif ".npy" in label:
-                label_array = np.load(label)
-            else:
-                ValueError("Unsupported format: .%s" %label.split(".")[-1])
-
-            lesions_in = {}
+        # if len(lesions) > 0: # If we are using conditioning, otherwise we dont care.
+        #     if ".npz" in label:
+        #         label_array = np.load(label)['label']
+        #     elif ".nii.gz" in label:
+        #         label_array = np.asarray(nib.load(label).dataobj)
+        #     elif ".npy" in label:
+        #         label_array = np.load(label)
+        #     else:
+        #         ValueError("Unsupported format: .%s" %label.split(".")[-1])
+        #
+        #     lesions_in = {}
+        #     for lesion in lesions:
+        #         # SLICING-LESIONS
+        #         if lesion_dim == -1:
+        #             lesion_array = label_array[..., LESION_CHANNELS[lesion]]
+        #         else:
+        #             lesion_array = label_array[LESION_CHANNELS[lesion], ...]
+        #         if report_folder is None:
+        #             if (lesion_array > 0).sum() > 0:
+        #                 lesions_in[lesion] = 1.0
+        #             else:
+        #                 lesions_in[lesion] = 0.0
+        #         else:
+        #             if lesion in maximums.keys():
+        #                 positives = (lesion_array > 0.5).sum()
+        #                 lesions_in[lesion] = np.round(positives / maximums[lesion], 6)
+        #             else:
+        #                 if (lesion_array > 0).sum() > 0:
+        #                     lesions_in[lesion] = 1.0
+        #                 else:
+        #                     lesions_in[lesion] = 0.0
+        #
+        #         row += [lesions_in[lesion]]
+        if len(lesions) > 0:
             for lesion in lesions:
-                # SLICING-LESIONS
-                if lesion_dim == -1:
-                    lesion_array = label_array[..., LESION_CHANNELS[lesion]]
-                else:
-                    lesion_array = label_array[LESION_CHANNELS[lesion], ...]
-                if report_folder is None:
-                    if (lesion_array > 0).sum() > 0:
-                        lesions_in[lesion] = 1.0
-                    else:
-                        lesions_in[lesion] = 0.0
-                else:
-                    if lesion in maximums.keys():
-                        positives = (lesion_array > 0.5).sum()
-                        lesions_in[lesion] = np.round(positives / maximums[lesion], 6)
-                    else:
-                        if (lesion_array > 0).sum() > 0:
-                            lesions_in[lesion] = 1.0
-                        else:
-                            lesions_in[lesion] = 0.0
-
-                row += [lesions_in[lesion]]
-
+                if os.path.join(label) in lesion_pixels.keys():
+                    row += [np.round( lesion_pixels[label][lesion] / lesion_maxes[lesion][-1], 6)]
         rows.append(row)
 
     # We shuffle
@@ -382,7 +472,8 @@ def create_datatext_source_label_gen(in_dirs: Union[list, str],
 def rewrite_tsv_with_new_sources(in_file,
                                  out_file,
                                  new_source: dict,
-                                 trvate = False):
+                                 trvate = False,
+                                 at_random = False):
 
    if trvate:
        for sub_file in ['train', 'validation', 'test']:
@@ -391,18 +482,31 @@ def rewrite_tsv_with_new_sources(in_file,
            for col in in_dirs_df:
                for i, row_value in in_dirs_df[col].iteritems():
                    for key, val in new_source.items():
-                       if key in in_dirs_df[col][i]:
-                           in_dirs_df[col][i] = in_dirs_df[col][i].replace(key, val)
-           in_dirs_df.to_csv(out_file.replace(".tsv", "_%s.tsv" %sub_file), sep = "\t")
+                       try:
+                           if key in in_dirs_df[col][i]:
+                               if at_random and np.random.uniform() > 0.5:
+                                   in_dirs_df[col][i] = in_dirs_df[col][i].replace(key, val)
+                               elif not at_random:
+                                   in_dirs_df[col][i] = in_dirs_df[col][i].replace(key, val)
+                       except:
+                           pass
+
+           in_dirs_df.to_csv(out_file.replace(".tsv", "_%s.tsv" %sub_file), sep = "\t", index=False)
    else:
        in_dirs_sf = in_file.replace("*", "_%s" % in_file)
        in_dirs_df = pd.read_csv(in_dirs_sf, sep="\t")
        for col in in_dirs_df:
            for i, row_value in in_dirs_df[col].iteritems():
                for key, val in new_source.items():
-                   if key in in_dirs_df[col][i]:
-                       in_dirs_df[col][i] = in_dirs_df[col][i].replace(key, val)
-       in_dirs_df.to_csv(out_file, sep = "\t")
+                   try:
+                       if key in in_dirs_df[col][i]:
+                           if at_random and np.random.uniform() > 0.5:
+                               in_dirs_df[col][i] = in_dirs_df[col][i].replace(key, val)
+                           elif not at_random:
+                               in_dirs_df[col][i] = in_dirs_df[col][i].replace(key, val)
+                   except:
+                       print("Couldn't perform replacement in column %s"  %col)
+       in_dirs_df.to_csv(out_file, sep = "\t", index=False,)
 
 
 def ddpDataDicts(data_dict):

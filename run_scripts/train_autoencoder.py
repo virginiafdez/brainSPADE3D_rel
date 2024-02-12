@@ -1,9 +1,8 @@
-# Before importing...
-import sys
 from label_ldm.label_generator.labelgen_utils import checkResolution, log_3d_img, get_lr, log_mlflow,\
     AdversarialReferee
 import os
 import torch
+from collections import OrderedDict
 from monai.losses import FocalLoss
 from monai.utils import set_determinism
 from torch.cuda.amp import GradScaler, autocast
@@ -21,6 +20,7 @@ from label_ldm.label_generator.labelgen_data_utils import get_training_loaders
 import mlflow.pytorch
 # Filter Warnings
 import warnings
+import monai
 warnings.filterwarnings("ignore", category=UserWarning)
 
 def parse_args():
@@ -38,13 +38,27 @@ def parse_args():
     parser.add_argument("--validation_epochs", type = int, default=10, help="After how many epochs we validate")
     parser.add_argument("--save_every", type = int, default = 5, help = "Every how many epochs we save")
     parser.add_argument("--augmentation", type=int, default=0, help = "Use augmentation.")
+    parser.add_argument("--noise_robustness", type=int, default = 0, help = "Loss that adds noise and makes"
+                                                                          "sure the reconstruction is still"
+                                                                          "good.")
+    parser.add_argument("--wmh_obsession", type=float, default=0.0, help= "Weight given to a WMH-specific focal loss.")
+    parser.add_argument("--random_x_stack", type = str, help = "If for one dimension"
+                                                               "in spatial_size you want the crop to be randm "
+                                                               "across that dimension, add that dimension number to "
+                                                               "this argument, spaced with -. ",
+                        default=None)
     args = parser.parse_args()
+    if args.random_x_stack is not None:
+        args.random_x_stack = [int(i) for i in args.random_x_stack.split("-")]
+    else:
+        args.random_x_stack = []
     return args
 
 def main(args):
 
     # Set mlflow
     set_determinism(42)
+
 
     # Set outputs directory (mlflow)
     #mlflow.set_tracking_uri(args.mlruns_path)
@@ -87,7 +101,10 @@ def main(args):
         augmentation=bool(args.augmentation),
         num_workers=args.num_workers,
         conditionings=[],
-        cache_dir=args.checkpoints_dir
+        cache_dir= None, #args.checkpoints_dir,
+        even_brats=True,
+        random_x_stack=args.random_x_stack
+
     )
 
     print("Creating model...")
@@ -114,15 +131,34 @@ def main(args):
     optimizer_g = torch.optim.Adam(model.parameters(), lr=config["stage1"]["base_lr"])
     optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=config["stage1"]["disc_lr"])
 
-
     # Get Checkpoint
     best_loss = float("inf")
     start_epoch = 0
     if resume:
         print(f"Using checkpoint!")
-        checkpoint = torch.load(str(run_dir / "checkpoint.pth"))
-        model.load_state_dict(checkpoint['state_dict'])
-        discriminator.load_state_dict(checkpoint['discriminator'])
+        try:
+            checkpoint = torch.load(str(run_dir / "checkpoint.pth"))
+            model.load_state_dict(checkpoint['state_dict'])
+        except:
+            if torch.cuda.device_count() == 1:
+                new_state_dict = OrderedDict()
+                for k, v in checkpoint['state_dict'].items():
+                    name = k.replace("module.", "")  # remove `module.`
+                    new_state_dict[name] = v
+                model.load_state_dict(new_state_dict, strict=False)
+            else:
+                print("Couldn't load checkpoint")
+        try:
+            discriminator.load_state_dict(checkpoint['discriminator'])
+        except:
+            if torch.cuda.device_count() == 1:
+                new_state_dict = OrderedDict()
+                for k, v in checkpoint['discriminator'].items():
+                    name = k.replace("module.", "")  # remove `module.`
+                    new_state_dict[name] = v
+                discriminator.load_state_dict(new_state_dict, strict=False)
+            else:
+                print("Couldn't load checkpoint")
         optimizer_g.load_state_dict(checkpoint['optimizer_g'])
         optimizer_d.load_state_dict(checkpoint['optimizer_d'])
         start_epoch = checkpoint['epoch']
@@ -133,7 +169,9 @@ def main(args):
     # Run training:
 
     # Define Losses (additional)
-    focal_loss = FocalLoss(include_background=True, gamma = 3)
+    w = np.ones(config['stage1']['params']['hparams']['in_channels'])
+    w[6] = 100
+    focal_loss = FocalLoss(include_background=True, gamma = 3, weight=w)
     adv_loss = PatchAdversarialLoss(criterion="least_squares")
     adv_referee = AdversarialReferee(n_steps=15, up_threshold=config['stage1']['adv_up_threshold'],
                                      down_threshold=config['stage1']['adv_down_threshold'],
@@ -144,9 +182,13 @@ def main(args):
         kl_loss = 0.5 * torch.sum(z_mu.pow(2) + z_sigma.pow(2) - torch.log(z_sigma.pow(2)) - 1, dim=[1, 2, 3, 4])
         return torch.sum(kl_loss) / kl_loss.shape[0]
 
+    if args.noise_robustness == 1:
+        tf_noise = monai.transforms.RandGaussianNoise(std = 0.05)
+
     # Summary writers
     writer_train = SummaryWriter(log_dir=str(run_dir / "train"))
     writer_val = SummaryWriter(log_dir=str(run_dir / "val"))
+
 
     # Training
     epoch_recon_loss_list = []
@@ -155,9 +197,12 @@ def main(args):
     val_recon_epoch_loss_list = []
     scaler_g = GradScaler()
     scaler_d = GradScaler()
-
+    stop_flag = False
     for epoch in range(start_epoch, args.num_epochs):
         print("epoch %d/%d" %(epoch, args.num_epochs))
+        if stop_flag:
+            "Finishing because of invalid values"
+            break
         model.train().to(device)
         discriminator.train().to(device)
         epoch_loss = 0
@@ -167,21 +212,48 @@ def main(args):
         steps_trained_dis = 0
         progress_bar = tqdm(enumerate(train_loader), total=len(train_loader), ncols=130)
         progress_bar.set_description(f"Epoch {epoch}")
-        train_losses = {'recon_loss': 0, 'kld_loss': 0, 'perceptual_loss': 0, 'gen_loss': 0, 'dis_loss': 0}
+        train_losses = {'recon_loss': 0, 'kld_loss': 0, 'perceptual_loss': 0, 'gen_loss': 0, 'dis_loss': 0,
+                        'noise_robustness_loss': 0, 'wmh_obsession': 0}
         for step, batch in progress_bar:
             images = batch["label"].to(device)  # choose only one of Brats channels
+            #print(batch['label_meta_dict']['filename_or_obj'])
+            if True in torch.isnan(images) or True in torch.isinf(images) or abs(images).max()>10000:
+                print("NaN, inf or extremely high value found in data")
+                print(batch['label_meta_dict']['filename_or_obj'])
+                stop_flag = True
+                break
             # Generator part
             optimizer_g.zero_grad(set_to_none=True)
-
-            with autocast(enabled = True):
+            with autocast(enabled = False):
                 reconstruction, z_mu, z_sigma = model(images)
+                if True in torch.isnan(reconstruction) or True in torch.isinf(reconstruction) or abs(reconstruction).max() > 10000:
+                    print("NaN, inf or extremely high value found in reconstruction")
+                    stop_flag = True
+                    break
                 kl_loss = KL_loss(z_mu, z_sigma)
                 recon_loss = focal_loss(reconstruction.float(), images.float())
+                if args.wmh_obsession > 0.0:
+                    wmh_loss = focal_loss(reconstruction.float()[:, 6:7, ...], images.float()[:, 6:7, ...])
                 reconstruction = torch.softmax(reconstruction.float(), 1)
                 p_loss = perceptual_loss(torch.argmax(reconstruction.float(), 1).unsqueeze(1).type(torch.float),
                                          torch.argmax(images.float(), 1).unsqueeze(1).type(torch.float)).mean()
                 # Loss generator
-                loss_g = recon_loss + config['stage1']['w_kl'] * kl_loss + config['stage1']['w_perceptual'] * p_loss
+                loss_g = recon_loss + config['stage1']['w_kl'] * kl_loss +  \
+                         config['stage1']['w_perceptual'] * p_loss
+                if args.wmh_obsession > 0.0:
+                    loss_g += args.wmh_obsession * wmh_loss
+
+                if args.noise_robustness:
+                    if torch.cuda.device_count() > 1:
+                        noisy = model.module.sampling(z_mu, z_sigma).detach().cpu()
+                        noisy = tf_noise(noisy.detach().cpu()).to(device)
+                        noisy = model.module.decode_stage_2_outputs(noisy)
+                    else:
+                        noisy = model.sampling(z_mu, z_sigma).detach().cpu()
+                        noisy = tf_noise(noisy.detach().cpu()).to(device)
+                        noisy = model.decode_stage_2_outputs(noisy)
+                    noise_robustness_loss = focal_loss(noisy.float(), images.float())
+                    loss_g += config['stage1']['w_noiserob'] * noise_robustness_loss
 
                 if adv_referee.permission2trainGen():
                     steps_trained_gen += 1
@@ -197,8 +269,8 @@ def main(args):
             scaler_g.update()
 
             # This needs to be computed
-            logits_fake = discriminator(reconstruction.contiguous().detach().cpu())[-1]
-            logits_real = discriminator(images.contiguous().detach().cpu())[-1]
+            logits_fake = discriminator(reconstruction.contiguous().detach())[-1]
+            logits_real = discriminator(images.contiguous().detach())[-1]
             # Add this to referee
             adv_referee.calculate_and_add_accuracies(logits_real=logits_real, logits_fake=logits_fake,
                                                      )
@@ -209,6 +281,10 @@ def main(args):
                 optimizer_d.zero_grad(set_to_none=True)
                 loss_d_fake = adv_loss(logits_fake, target_is_real=False, for_discriminator=True)
                 loss_d_real = adv_loss(logits_real, target_is_real=True, for_discriminator=True)
+                if True in torch.isnan(logits_fake) or True in torch.isinf(logits_fake) or abs(logits_fake).max() > 10000:
+                    print("NaN, inf or extremely high value found in disc. logits")
+                    stop_flag = True
+                    break
                 discriminator_loss = (loss_d_fake + loss_d_real) * 0.5
                 loss_d = config['stage1']['w_adversarial'] * discriminator_loss
                 loss_d = loss_d.mean()
@@ -227,12 +303,15 @@ def main(args):
             if adv_referee.permission2trainDis():
                 disc_epoch_loss += discriminator_loss.item()
 
+            if not args.noise_robustness:
+                noise_robustness_loss = torch.tensor(0.0)
             progress_bar.set_postfix(
                     {
                         "recons_loss": epoch_loss / (step + 1),
                         "gen_loss": gen_epoch_loss / (step + 1),
                         "disc_loss": disc_epoch_loss / (step + 1),
-                        "accuracy_disc": adv_referee.getAccuracy()
+                        "accuracy_disc": adv_referee.getAccuracy(),
+                        "noiser": noise_robustness_loss
                     }
                 )
 
@@ -241,6 +320,9 @@ def main(args):
             train_losses['perceptual_loss'] += p_loss.item() * config['stage1']['w_perceptual']
             train_losses['gen_loss'] += loss_g.item()
             train_losses['dis_loss'] += loss_d.item()
+            train_losses['noise_robustness_loss'] += loss_d.item()
+            if args.wmh_obsession > 0:
+                train_losses['wmh_obsession'] += wmh_loss.item() * args.wmh_obsession
 
         # Global loss
         epoch_recon_loss_list.append(epoch_loss / (step + 1))
@@ -261,7 +343,9 @@ def main(args):
             progress_bar = tqdm(enumerate(val_loader), total=len(val_loader), ncols=110)
             progress_bar.set_description(f"Validation epoch {epoch}")
             val_losses = {'recon_loss': 0, 'kld_loss': 0, 'perceptual_loss': 0,
-                          'gen_loss': 0, 'dis_loss': 0}
+                          'gen_loss': 0, 'dis_loss': 0, 'wmh_obsession': 0}
+            if args.noise_robustness:
+                val_losses['noise_rob'] = 0
             to_plot_item = np.random.choice(len(val_loader)-1)
             for step, batch in progress_bar:
                 images = batch["label"].to(device)  # choose only one of Brats channels
@@ -270,6 +354,8 @@ def main(args):
                         reconstruction, z_mu, z_sigma = model(images)
                         kl_loss = KL_loss(z_mu, z_sigma)
                         recon_loss = focal_loss(reconstruction.float(), images.float())
+                        if args.wmh_obsession > 0.0:
+                            wmh_loss = focal_loss(reconstruction.float()[:, 6:7, ...], images.float()[:, 6:7, ...])
                         reconstruction = torch.softmax(reconstruction.float(), 1)
                         p_loss = perceptual_loss(torch.argmax(reconstruction.float(), 1).unsqueeze(1).type(torch.float),
                                                  torch.argmax(images.float(), 1).unsqueeze(1).type(torch.float)).mean()
@@ -278,13 +364,27 @@ def main(args):
                         logits_fake = discriminator(reconstruction.contiguous().float())[-1]
                         generator_loss = adv_loss(logits_fake, target_is_real=True, for_discriminator=False)
                         loss_g += config['stage1']['w_adversarial'] * generator_loss
-
+                        if args.wmh_obsession>0.0:
+                            loss_g += wmh_loss * args.wmh_obsession
                         logits_fake = discriminator(reconstruction.contiguous().detach())[-1]
                         loss_d_fake = adv_loss(logits_fake, target_is_real=False, for_discriminator=True)
                         logits_real = discriminator(images.contiguous().detach())[-1]
                         loss_d_real = adv_loss(logits_real, target_is_real=True, for_discriminator=True)
                         discriminator_loss = (loss_d_fake + loss_d_real) * 0.5
                         loss_d = config['stage1']['w_adversarial'] * discriminator_loss
+
+                        if args.noise_robustness:
+                            if torch.cuda.device_count() > 1:
+                                noisy = model.module.sampling(z_mu, z_sigma).detach().cpu()
+                                noisy = tf_noise(noisy.detach().cpu()).to(device)
+                                noisy = model.module.decode_stage_2_outputs(noisy)
+                            else:
+                                noisy = model.sampling(z_mu, z_sigma).detach().cpu()
+                                noisy = tf_noise(noisy.detach().cpu()).to(device)
+                                noisy = model.decode_stage_2_outputs(noisy)
+                            noise_robustness_loss = focal_loss(noisy.float(), images.float())
+                            loss_g += config['stage1']['w_noiserob'] * noise_robustness_loss
+
                 if step == to_plot_item:
                     reconstruction = reconstruction.detach().cpu() # We plot the reconstruction
                     gt = images.detach().cpu()
@@ -296,13 +396,17 @@ def main(args):
                 val_losses['perceptual_loss'] = p_loss.item() * config['stage1']['w_perceptual']
                 val_losses['gen_loss'] = loss_g.item()
                 val_losses['dis_loss'] = loss_d.item()
+                if args.wmh_obsession > 0:
+                    val_losses['wmh_obsession'] = wmh_loss.item()
+                if args.noise_robustness:
+                    val_losses['noise_rob'] = noise_robustness_loss
                 val_recon_epoch_loss_list.append(sum(val_losses.values()))
 
             for key, val in val_losses.items():
                 val_losses[key] = val / len(val_loader)
             val_recon_epoch_loss_list[-1] /= len(val_loader)
-            for k, v in train_losses.items():
-                writer_val.add_scalar(f"{k}", v, epoch * len(val_loader) + step)
+            for k, v in val_losses.items():
+                writer_val.add_scalar(f"{k}", v, epoch * len(train_loader) + step)
 
             print("Validation results: %s" %", ".join(["%s: %.6f" %(key, val) for key, val in val_losses.items()]))
 
@@ -317,14 +421,17 @@ def main(args):
                 "best_loss": best_loss,
             }
 
-        # Save checkpoint
-        torch.save(checkpoint, os.path.join(args.checkpoints_dir, "checkpoint.pth"))
+             # Save checkpoint
+            torch.save(checkpoint, os.path.join(args.checkpoints_dir, "checkpoint.pth"))
+            if epoch%5==0:
+                torch.save(checkpoint, os.path.join(args.checkpoints_dir, "checkpoint_%d.pth" %epoch))
 
-        if val_recon_epoch_loss_list[-1] <= best_loss:
-            print(f"New best val loss {val_recon_epoch_loss_list[-1]}")
-            best_loss = val_recon_epoch_loss_list[-1]
-            raw_model = model.module if hasattr(model, "module") else model
-            torch.save(raw_model.state_dict(), str(os.path.join(args.checkpoints_dir, "best_model.pth")))
+        if len(val_recon_epoch_loss_list) > 0:
+            if val_recon_epoch_loss_list[-1] <= best_loss:
+                print(f"New best val loss {val_recon_epoch_loss_list[-1]}")
+                best_loss = val_recon_epoch_loss_list[-1]
+                raw_model = model.module if hasattr(model, "module") else model
+                torch.save(raw_model.state_dict(), str(os.path.join(args.checkpoints_dir, "best_model.pth")))
 
     print(f"Training finished!")
     print(f"Saving final model...")
@@ -342,6 +449,7 @@ def main(args):
         experiment="vae",
         run_dir=run_dir,
         val_loss=log_val_loss,
+        local = False,
     )
 
     if os.path.isdir(os.path.join(args.checkpoints_dir, 'cache')):

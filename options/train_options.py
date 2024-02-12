@@ -160,6 +160,7 @@ class TrainOptions(BaseOptions):
                             help='if specified, do *not* use VGG feature matching loss')
         parser.add_argument('--gan_mode', type=str, default='hinge', help='(ls|original|hinge)')
         parser.add_argument('--lambda_kld', type=float, default=0.05)
+        parser.add_argument('--lambda_style_slice_consistency', type=float, default=1.0, help="Weight for slice consistency")
         parser.add_argument('--train_enc_only', type =int, default = None, help="From this epoch onwards, train only"
                                                                                  "the encoder (and not the decoder)")
         parser.add_argument('--batch_acc_fr', type=int, default = 0, help="Frequency of batch accumulation.")

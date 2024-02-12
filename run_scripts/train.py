@@ -2,6 +2,7 @@ import os
 import moreutils as uvir
 from options.train_options import TrainOptions
 import data
+import sys
 import nibabel as nib
 from utils.iter_counter import IterationCounter
 from utils.visualizer import Visualizer
@@ -22,6 +23,20 @@ from utils.util import tensor2im, tensor2label
 import torch.distributed as dist
 from data.dataset_utils import ddpDataDicts
 from  monai.data import ThreadDataLoader
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+##
+from pynvml.smi import nvidia_smi
+
+from pynvml.smi import nvidia_smi
+
+def print_gpu_memory_report():
+    if torch.cuda.is_available():
+        nvsmi = nvidia_smi.getInstance()
+        data = nvsmi.DeviceQuery("memory.used, memory.total, utilization.gpu")["gpu"]
+        print("Memory report")
+        for i, data_by_rank in enumerate(data):
+            mem_report = data_by_rank["fb_memory_usage"]
+            print(f"gpu:{i} mem(%) {int(mem_report['used'] * 100.0 / mem_report['total'])}")
 
 # Parse options
 opt = TrainOptions().parse()
@@ -40,6 +55,8 @@ if opt.use_ddp:
             sys.stdout = sys.stderr = f
         # initialize the distributed training process, every GPU runs in a process
         dist.init_process_group(backend="nccl", init_method="env://")
+        print(dist.get_rank())
+        print(dist.get_world_size())
         device = torch.device(f"cuda:{local_rank}")
 
     else:
@@ -51,11 +68,11 @@ else:
 
 # Dataset
 dataset_container = Spade3DSet(opt)
-
 train_set, val_set = dataset_container.getDatasets()
 if opt.use_ddp:
-    loader = ThreadDataLoader(train_set, shuffle = False, batch_size=opt.batchSize, num_workers=opt.nThreads, )
-    loader_val = ThreadDataLoader(val_set, shuffle=False, batch_size=opt.batchSize, num_workers=opt.nThreads, )
+    #ThreadDataLoader
+    loader = monai.data.DataLoader(train_set, shuffle = False, batch_size=opt.batchSize, num_workers=opt.nThreads, )
+    loader_val = monai.data.DataLoader(val_set, shuffle=False, batch_size=opt.batchSize, num_workers=opt.nThreads, )
 else:
     loader = monai.data.DataLoader(train_set, shuffle=False, batch_size=opt.batchSize, num_workers=opt.nThreads)
     loader_val = monai.data.DataLoader(val_set, shuffle=False, batch_size=opt.batchSize, num_workers=opt.nThreads)
@@ -89,6 +106,7 @@ for epoch in iter_counter.training_epochs():
     train_dis_count = 0
     train_total = 0
     for dind, data_i in enumerate(tqdm(loader)):
+        print_gpu_memory_report()
         train_total += 1
         # Phase 1 Generator training.
         # If accuracy is none, we train.
@@ -121,6 +139,7 @@ for epoch in iter_counter.training_epochs():
 
         # Phase 1 Generator training.
         if train_gen:
+            print("Training the generator on... %s" %device)
             # If train_enc_only < epochs it means that from this epoch onward we only
             # train the encoder. Otherwise, both.
             iter_counter.record_one_gradient_iteration_gen()
@@ -204,8 +223,8 @@ for epoch in iter_counter.training_epochs():
                                       epoch = iter_counter.current_epoch,
                                       iter = iter_counter.epoch_iter)
         if iter_counter.needs_D_display():
-            visualizer.plot_D_results(outputs_D, epoch, iter_counter.epoch_iter) # Plot discriminator outputs
-
+            if opt.use_ddp and dist.get_rank() == 0 or not opt.use_ddp:
+                visualizer.plot_D_results(outputs_D, epoch, iter_counter.epoch_iter) # Plot discriminator outputs
 
         # Clear.
         clear_data(trainer, data_i)

@@ -125,7 +125,6 @@ class PerceptualLoss(nn.Module):
 
         return torch.mean(loss)
 
-
 class MedicalNetPerceptualSimilarity(nn.Module):
     """
     Component to perform the perceptual evaluation with the networks pretrained by Chen, et al. "Med3D: Transfer

@@ -151,8 +151,11 @@ class BaseOptions():
                             help='# of input label classes without unknown class. If you have unknown class as class label, specify --contain_dopntcare_label.')
         parser.add_argument('--contain_dontcare_label', action='store_true',
                             help='if the label map contains dontcare label (dontcare=255)')
+        parser.add_argument('--style_slice_consistency', action='store_true', help="Style slice consistency.")
         parser.add_argument('--shuffle', action='store_true', help = "Whether to shuffle labels in training."
                                                                      "This won't affect interleaved modality selection.")
+        parser.add_argument('--chunk_size', type = int, default = None, help = "If, along the axial dimension, you want to select random"
+                                                               "chuncks of [chunk_size] shape.",)
         self.initialized = True
 
         return parser
@@ -192,7 +195,7 @@ class BaseOptions():
 
     def print_options(self, opt):
 
-        if not opt.use_ddp:
+        if opt.mode == 'test' or not opt.use_ddp:
             message = ''
             message += '----------------- Options ---------------\n'
             for k, v in sorted(vars(opt).items()):
@@ -265,10 +268,10 @@ class BaseOptions():
             id = int(str_id)
             if id >= 0:
                 opt.gpu_ids.append(id)
-        if len(opt.gpu_ids) > 0:
-            torch.cuda.set_device(opt.gpu_ids[0])
+        #if len(opt.gpu_ids) > 0:
+        #    torch.cuda.set_device(opt.gpu_ids[0])
 
-        if opt.use_dp and not opt.use_ddp:
+        if opt.mode == 'test' or (opt.use_dp and not opt.use_ddp):
             assert len(opt.gpu_ids) == 0 or opt.batchSize % len(opt.gpu_ids) == 0, \
                 "Batch size %d is wrong. It must be a multiple of # GPUs %d." \
                 % (opt.batchSize, len(opt.gpu_ids))
@@ -278,6 +281,8 @@ class BaseOptions():
         if opt.mode == 'train' and opt.batchSize < 4:
             opt.latent_triplet_loss = False
             print("Triplet loss deactivated because batch size is insufficient.")
+        if opt.mode == 'test':
+            opt.augment = False
 
         self.opt = opt
         return self.opt

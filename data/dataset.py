@@ -21,11 +21,15 @@ class Spade3DSet():
         self.opt = opt
         self.modalities = opt.sequences
         self.fix_seq = opt.fix_seq
-        self.use_ddp = opt.use_ddp
+        if opt.mode == 'train':
+            self.use_ddp = opt.use_ddp
+        else:
+            self.use_ddp = False
         self.style_extension = None
         self.cut = opt.cut
         self.non_corresponding_dirs = opt.non_corresponding_dirs
         self.non_corresponding_ims = opt.non_corresponding_ims
+        self.style_slice_consistency = opt.style_slice_consistency
 
 
         # Image, label and styles
@@ -56,6 +60,9 @@ class Spade3DSet():
                     "non_corresponding_dirs is False.")
         self.mode = opt.mode
         self.crop_size = opt.crop_size
+        self.chunk_size = opt.chunk_size
+        if self.chunk_size is None:
+            self.chunk_size = opt.crop_size[-1]
         self.max_size = opt.max_dataset_size
         self.cache_dir = None
 
@@ -136,7 +143,6 @@ class Spade3DSet():
                     test_set = Dataset(self.data_dict_test, transform=transforms_test)
             lock.release()
             return test_set
-
 
     def __len__(self):
         if self.mode == 'train':
@@ -321,15 +327,26 @@ class Spade3DSet():
                             output_dict['style_mask'] = element_style['label']
                         else:
                             output_dict['style_mask'] = None
+                        if self.style_slice_consistency and getExtension(output_dict['style_mask']) != '.nii.gz':
+                            element_style = np.random.choice(val['style_dict_per_mod'][mod])
+                            output_dict['style_image_scextra'] = element_style[modality]
+                            if 'label' in element_style.keys():
+                                output_dict['style_mask_scextra'] = element_style['label']
+                            else:
+                                output_dict['style_mask_scextra'] = None
 
                     else:
                         output_dict['style_image'] = element_data[modality]
                         output_dict['style_mask'] = element_data['label']
+                        if getExtension(output_dict['style_mask']) != '.nii.gz' and self.style_slice_consistency:
+                            output_dict['style_image_scextra'] = element_data[modality]
+                            output_dict['style_mask_scextra'] = element_data['label']
 
                     if self.style_extension is None:
                         self.style_extension = getExtension(output_dict['style_mask'])
 
-                    val['counter_data'][modality] = val['counter_data'][modality] +  1
+                    val['counter_data'][modality] = val['counter_data'][modality] + 1
+
                     if val['counter_data'][modality] == len(val['data_dict_per_mod'][modality]):
                         val['counter_data'][modality] = 0
                 else:
@@ -344,17 +361,20 @@ class Spade3DSet():
                     if len(possible_modalities) == 0 and not self.non_corresponding_ims and not self.non_corresponding_dirs:
                         ValueError("Element %s does not contain any relevant modality. Either set self.non_corresponding_ims"
                                    "or self.non_corresponding_dirs to 1")
-                    elif len(possible_modalities) == 0:
-                        modality = np.random.choice(modalities)
-                        element_style = np.random.choice(val['style_dict_per_mod'][modality])
+                        counter += 1
+                        data_train_ctr[element_data['label']] = True
+                        continue
+                    else:
+                        modality = np.random.choice(possible_modalities)
+                        if self.non_corresponding_ims:
+                            element_style = np.random.choice(val['style_dict_per_mod'][modality])
+                        else:
+                            element_style = element_data
                         output_dict['image'] = output_dict['style_image'] = element_style[modality]
                         output_dict['style_mask'] = element_style['label']
-                    else:
-                        modality = np.random.choice(modalities)
-                        output_dict['image'] = element_data[modality]
-                        element_style = np.random.choice(val['style_dict_per_mod'][modality])
-                        output_dict['style_mask'] = element_style['label']
-                        output_dict['style_image'] = element_style[modality]
+                        if self.style_slice_consistency and getExtension(output_dict['style_mask']) != '.nii.gz':
+                            output_dict['style_image_scextra'] = element_style[modality]
+                            output_dict['style_mask_scextra'] = element_style['label']
                     if self.style_extension is None:
                         self.style_extension = getExtension(output_dict['style_mask'])
 
@@ -394,6 +414,8 @@ class Spade3DSet():
         # Otherwise, crop in the center and then selection of one slice will be applied on the nifti volume to get
         # the 2D slice.
 
+        if self.chunk_size is not None:
+            roi_randcrop = [-1, -1, self.chunk_size]
         if self.cut == 'a':
             roi_size = [-1, -1, 1]
             roi_crop = [-1, -1, self.crop_size[-1]//3]
@@ -412,25 +434,45 @@ class Spade3DSet():
 
         # This is horribly coded... sorry! In a rush.
         if self.style_extension == '.nii.gz':
+            if self.non_corresponding_dirs and self.mode != 'train':
+                keys_volume = ['label']
+                keys_slice = ['image', 'style_mask', 'style_image']
+            else:
+                keys_volume = ['label', 'image']
+                keys_slice = ['style_mask', 'style_image']
             transforms.append(monai.transforms.LoadImaged(keys = ['image', 'label', 'style_image', 'style_mask'])) # Niftis
             transforms.append(monai.transforms.AddChanneld(keys=['style_image', 'image']))
             transforms.append(monai.transforms.AsChannelFirstd(keys=['label', 'style_mask'], channel_dim=-1))
-            transforms.append(monai.transforms.CenterSpatialCropd(roi_size=roi_crop, keys = ['style_image', 'style_mask']))
-            transforms.append(monai.transforms.RandSpatialCropSamplesd(max_roi_size=roi_size, roi_size=roi_size, keys = ['style_image',
-                                                                                                     'style_mask'],
-                                                                       num_samples=1))
-            transforms.append(monai.transforms.SqueezeDimd(dim = squeeze_dim, keys = ['style_image', 'style_mask']))
-            transforms.append(monai.transforms.CenterSpatialCropd(keys=['image', 'label'], roi_size=self.crop_size))
-            transforms.append(monai.transforms.SpatialPadd(keys=['image', 'label'], spatial_size=self.crop_size,
+            transforms.append(monai.transforms.CenterSpatialCropd(roi_size=roi_crop, keys = keys_slice))
+            if self.style_slice_consistency:
+                transforms.append(monai.transforms.CopyItemsd(keys=['style_image'], names=['style_image_scextra']))
+                transforms.append(monai.transforms.CopyItemsd(keys=['style_mask'], names=['style_mask_scextra']))
+
+            if self.style_slice_consistency:
+                transforms.append(monai.transforms.RandSpatialCropd(max_roi_size=roi_size, roi_size=roi_size,
+                                                                    keys = ['style_image_scextra', 'style_mask_scextra'],))
+            transforms.append(monai.transforms.RandSpatialCropd(max_roi_size=roi_size, roi_size=roi_size,
+                                                                keys = keys_slice))
+            if self.style_slice_consistency:
+                keys_slice.append("style_mask_scextra")
+                keys_slice.append("style_image_scextra")
+
+
+            transforms.append(monai.transforms.SqueezeDimd(dim = squeeze_dim, keys = keys_slice))
+            transforms.append(monai.transforms.CenterSpatialCropd(keys=keys_volume, roi_size=self.crop_size))
+            transforms.append(monai.transforms.SpatialPadd(keys=keys_volume, spatial_size=self.crop_size,
                                                            method='symmetric'))
+            if self.chunk_size is not None:
+                transforms.append(monai.transforms.RandSpatialCropd(max_roi_size=roi_randcrop, roi_size=roi_randcrop,
+                                                                    keys = keys_volume))
             transforms.append(
-                monai.transforms.SpatialPadd(keys=['style_image', 'style_mask'], spatial_size=self.crop_size[:-1],
+                monai.transforms.SpatialPadd(keys=keys_slice, spatial_size=self.crop_size[:-1],
                                              method='symmetric'))
-            transforms.append(monai.transforms.Lambdad(keys=['style_mask'], func=lambda l: np.concatenate(
+            transforms.append(monai.transforms.Lambdad(keys=[ks for ks in keys_slice if 'mask' in ks], func=lambda l: np.concatenate(
                 [np.expand_dims(1 - np.sum(l[1:, ...], 0), 0), l[1:, ...]], 0)))
             transforms.append(monai.transforms.Lambdad(keys=['label'], func=lambda l: np.concatenate(
                 [np.expand_dims(1 - np.sum(l[1:, ...], 0), 0), l[1:, ...]], 0)))
-            transforms.append(monai.transforms.CenterSpatialCropd(keys=['style_image', 'style_mask'],
+            transforms.append(monai.transforms.CenterSpatialCropd(keys=keys_slice,
                                                                   roi_size=self.crop_size[:-1]))
 
         else:
@@ -446,6 +488,10 @@ class Spade3DSet():
                 transforms.append(monai.transforms.CenterSpatialCropd(keys=['label'], roi_size=self.crop_size))
                 transforms.append(monai.transforms.SpatialPadd(keys=['label'], spatial_size=self.crop_size,
                                                                method='symmetric'))
+                if self.chunk_size is not None:
+                    transforms.append(
+                        monai.transforms.RandSpatialCropd(max_roi_size=roi_randcrop, roi_size=roi_randcrop,
+                                                          keys=['label']))
                 transforms.append(
                     monai.transforms.SpatialPadd(keys=['style_image','image'], spatial_size=self.crop_size[:-1],
                                                  method='symmetric'))
@@ -461,6 +507,14 @@ class Spade3DSet():
                     monai.transforms.LoadImaged(keys=['image', 'label']))  # Niftis
                 transforms.append(monai.transforms.LoadImaged(keys=['style_image'], reader='numpyreader', npz_keys=('img')))  # Npz
                 transforms.append(monai.transforms.LoadImaged(keys=['style_mask'], reader='numpyreader', npz_keys=('label')))  # Npz
+                if self.style_slice_consistency:
+                    transforms.append(monai.transforms.LoadImaged(keys=['style_image_scextra'], reader='numpyreader',
+                                                                  npz_keys=('img')))  # Npz
+                    transforms.append(monai.transforms.LoadImaged(keys=['style_mask_scextra'], reader='numpyreader',
+                                                                  npz_keys=('label')))  # Npz
+                    transforms.append(monai.transforms.AddChanneld(keys=['style_image_scextra']))
+                    transforms.append(monai.transforms.AddChanneld(keys=['style_mask_scextra']))
+
                 transforms.append(monai.transforms.AddChanneld(keys=['style_image']))
                 transforms.append(monai.transforms.AddChanneld(keys=['image']))
                 transforms.append(monai.transforms.EnsureChannelFirstd(keys=['label'], channel_dim=-1))
@@ -468,27 +522,33 @@ class Spade3DSet():
                 transforms.append(monai.transforms.CenterSpatialCropd(keys=['image', 'label'], roi_size=self.crop_size))
                 transforms.append(monai.transforms.SpatialPadd(keys=['image', 'label'], spatial_size=self.crop_size,
                                                                method='symmetric'))
+                if self.chunk_size is not None:
+                    transforms.append(
+                        monai.transforms.RandSpatialCropd(max_roi_size=roi_randcrop, roi_size=roi_randcrop,
+                                                          keys=['image', 'label']))
+                if self.style_slice_consistency:
+                    keys_slice = ['style_image', 'style_mask', 'style_mask_scextra', 'style_image_scextra']
+                else:
+                    keys_slice = ['style_image', 'style_mask',]
                 transforms.append(
-                    monai.transforms.SpatialPadd(keys=['style_image', 'style_mask'], spatial_size=self.crop_size[:-1],
+                    monai.transforms.SpatialPadd(keys=keys_slice, spatial_size=self.crop_size[:-1],
                                                  method='symmetric'))
-                transforms.append(monai.transforms.Lambdad(keys=['style_mask'], func=lambda l: np.concatenate(
+                transforms.append(monai.transforms.Lambdad(keys=[ks for ks in keys_slice if 'mask' in ks], func=lambda l: np.concatenate(
                     [np.expand_dims(1 - np.sum(l[1:, ...], 0), 0), l[1:, ...]], 0)) if l.shape[0] > 1 else l)
                 transforms.append(monai.transforms.Lambdad(keys=['label'], func=lambda l: np.concatenate(
                     [np.expand_dims(1 - np.sum(l[1:, ...], 0), 0), l[1:, ...]], 0)))
-                transforms.append(monai.transforms.CenterSpatialCropd(keys=['style_image', 'style_mask'],
+                transforms.append(monai.transforms.CenterSpatialCropd(keys=keys_slice,
                                                                       roi_size=self.crop_size[:-1]))
 
         # Augmenting
         aug_transforms = []
         if self.opt.mode == 'train' and self.opt.augment:
-            aug_transforms.append(monai.transforms.RandBiasFieldd(coeff_range=(0, 0.005), prob=0.33, keys=['style_image',
-                                                                                                     ]),
+            aug_transforms.append(monai.transforms.RandBiasFieldd(coeff_range=(0, 0.005), prob=0.33, keys=[ks for ks in keys_slice if 'image' in ks]),
                               )
-            aug_transforms.append(monai.transforms.RandAdjustContrastd(gamma=(0.9, 1.15), prob=0.33, keys=['style_image',
-                                                                                                      ]))
+            aug_transforms.append(monai.transforms.RandAdjustContrastd(gamma=(0.9, 1.15), prob=0.33, keys=[ks for ks in keys_slice if 'image' in ks]))
             aug_transforms.append(monai.transforms.RandGaussianNoised(prob=0.33, mean=0.0,
                                                     std=np.random.uniform(0.005, 0.015),
-                                                                  keys=['style_image']))
+                                                                  keys=[ks for ks in keys_slice if 'image' in ks]))
             aug_transforms.append(monai.transforms.RandAffined(
                 rotate_range=[-0.05, 0.05],
                 shear_range=[0.001, 0.05],
@@ -504,6 +564,8 @@ class Spade3DSet():
         end_transforms = []
         end_transforms.append(monai.transforms.CopyItemsd(keys=['label'], names=['label_channel']))
         end_transforms.append(monai.transforms.CopyItemsd(keys=['style_mask'], names=['style_mask_channel']))
+        if self.style_slice_consistency:
+            end_transforms.append(monai.transforms.CopyItemsd(keys=['style_mask_scextra'], names=['style_mask_scextra_channel']))
 
         if self.non_corresponding_dirs and self.mode != "train":
             mask_4_image_key = 'style_mask_channel'
@@ -517,11 +579,20 @@ class Spade3DSet():
                                                            func = lambda l: np.stack([l[0, ...] < 0.35]*1, 0)))
             end_transforms.append(monai.transforms.MaskIntensityd(keys = ['image'], mask_key=mask_4_image_key))
             end_transforms.append(monai.transforms.MaskIntensityd(keys=['style_image'], mask_key='style_mask_channel'))
+            if self.style_slice_consistency:
+                end_transforms.append(monai.transforms.Lambdad(keys=['style_mask_scextra_channel'],
+                                                               func=lambda l: np.stack([l[0, ...] < 0.35] * 1, 0)))
+                end_transforms.append(
+                    monai.transforms.MaskIntensityd(keys=['style_image_scextra'], mask_key='style_mask_scextra_channel'))
         end_transforms.append(monai.transforms.NormalizeIntensityd(keys=['image']))
         end_transforms.append(monai.transforms.NormalizeIntensityd(keys=['style_image']))
+        if self.style_slice_consistency:
+            end_transforms.append(monai.transforms.NormalizeIntensityd(keys=['style_image_scextra']))
+            end_transforms.append(monai.transforms.ToTensord(keys=['style_image_scextra', 'style_mask_scextra']))
         end_transforms.append(monai.transforms.ToTensord(keys=['style_image', 'image', 'label', 'style_mask'],
                                                          ),
                               )
+
         val_transforms = monai.transforms.Compose(transforms + end_transforms)
         if self.opt.augment:
             train_transforms = monai.transforms.Compose(transforms + aug_transforms + end_transforms)
@@ -544,6 +615,3 @@ class Spade3DSet():
             self.data_dict_test, _ = self.retrieveMONAIdicts(shuffle=False, perc_val=0.0)
             test_set = self.getDatasets()
             return test_set
-
-
-
