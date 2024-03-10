@@ -6,7 +6,7 @@ import monai
 import matplotlib.pyplot as plt
 from options.test_options import TestOptions
 from data.dataset import Spade3DSet
-from moreutils import saveNiiGrid, getRGBGrid, reconvert_styles, structural_Similarity
+from moreutils import getRGBGrid, reconvert_styles, structural_Similarity
 import torch
 from tqdm import tqdm
 from models_spade.pix2pix_model import Pix2PixModel
